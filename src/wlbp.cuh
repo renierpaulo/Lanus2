@@ -28,6 +28,8 @@
 
 #ifdef __CUDACC__
 #define WLBP_DEV __device__
+/* __device__ only — same rationale as SECP_QUAL in secp256k1.cuh.
+ * Host tests define WLBP_DEV / WLBP_INLINE as shims before including. */
 #define WLBP_INLINE __host__ __device__ __forceinline__
 #define WLBP_LOAD(p) (*(p))
 #else

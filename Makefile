@@ -2,9 +2,17 @@
 # Detecta automaticamente o sistema operacional para comandos bÃƒÂ¡sicos
 
 NVCC = nvcc
-# Ajuste a arquitetura conforme necessÃƒÂ¡rio (sm_89 = RTX 4090, sm_90 = H100/Blackwell)
+# Ajuste a arquitetura conforme necessÃ¡rio (sm_89 = RTX 4090, sm_120 = RTX 5090)
 ARCH = sm_89
-NVCC_FLAGS = -O3 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3"
+NVCC_FLAGS = -O3 -arch=$(ARCH) --use_fast_math -Xcompiler "-O3" -Xptxas -O3,-v -lineinfo
+
+# DEV=1 : build rÃ¡pido (~1-2min) somente com o kernel solo (x2/x3/wide excluÃ­dos).
+#         Uso: make DEV=1
+# make     : build completo (todos os kernels) para produÃ§Ã£o.
+ifeq ($(DEV),1)
+NVCC_FLAGS += -DDEV_BUILD
+TARGET_NAME = bip39_scanner_dev
+endif
 
 SRC_DIR = src
 BUILD_DIR = build

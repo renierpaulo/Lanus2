@@ -137,14 +137,12 @@ __device__ __forceinline__ void checksum_fast_init(const uint16_t* base11,
 }
 
 // ---------------------------------------------------------------------------
-// checksum_fast_check - per candidate (w12 = 0..2047)
-//
-// Patches W[3] with the candidate's top 7 bits, extends the schedule from
-// word 18 (16/17 are precomputed), runs rounds 3..63 from the mini-midstate
-// and compares the top 4 bits of hash word 0 against w12's low 4 bits.
+// checksum_fast_cs4 - per candidate: the EXPECTED 4-bit checksum for the
+// entropy completed by w12's top 7 bits. Primitive for the direct-valid
+// enumeration: valid_w12 = (v << 4) | checksum_fast_cs4(&cst, v << 4).
 // ---------------------------------------------------------------------------
-__device__ __forceinline__ bool checksum_fast_check(const ChecksumFastState_t* st,
-                                                    uint16_t w12)
+__device__ __forceinline__ uint32_t checksum_fast_cs4(const ChecksumFastState_t* st,
+                                                      uint16_t w12)
 {
     // 16-word circular schedule. Slot pre-fill exploits that the values W[0]
     // and W[1] are only consumed by rounds 0/1 (inside the midstate) and by
@@ -178,8 +176,17 @@ __device__ __forceinline__ bool checksum_fast_check(const ChecksumFastState_t* s
     }
 
     // Single-block compression: hash word 0 = IV0 + a. Checksum = its top 4 bits.
-    uint32_t cs4 = (0x6a09e667u + a) >> 28;
-    return cs4 == (uint32_t)(w12 & 0x0Fu);
+    return (0x6a09e667u + a) >> 28;
+}
+
+// ---------------------------------------------------------------------------
+// checksum_fast_check - per candidate (w12 = 0..2047): true iff this exact
+// w12 carries the checksum its entropy implies.
+// ---------------------------------------------------------------------------
+__device__ __forceinline__ bool checksum_fast_check(const ChecksumFastState_t* st,
+                                                    uint16_t w12)
+{
+    return checksum_fast_cs4(st, w12) == (uint32_t)(w12 & 0x0Fu);
 }
 
 #endif // CHECKSUM_FAST_CUH

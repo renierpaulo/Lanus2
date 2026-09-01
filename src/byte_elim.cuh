@@ -51,10 +51,18 @@
 
 #include "sha512.cuh"     // K512, sigma/gamma_512, ch64/maj64 â€” round primitives only
 #include "secp256k1.cuh"  // windowed fixed-G scalar mult + field arithmetic
+#include "keccak256.cuh"  // ETH: keccak256(pubkey uncompressed)[12..32)
 
-// device globals shared with main.cu (definition lives in main.cu)
+// device globals shared with main.cu (single-TU: defined here, include guard protects)
 __constant__ uint8_t* d_target_hashes_ptr;
 __constant__ uint32_t d_num_targets;
+
+// lanus CLI parity: coin selector + bloom filter state
+__constant__ uint32_t d_coin;            // 0 = BTC, 60 = ETH
+__constant__ uint32_t d_use_bloom;
+__device__ uint8_t* d_bloom_bits = nullptr;
+__constant__ uint64_t d_bloom_m_bits;
+__constant__ uint32_t d_bloom_k;
 
 // ---------------------------------------------------------------------------
 // Small helpers (unique be_ names â€” this TU also hosts sha256.cuh/ripemd160.cuh)
@@ -374,19 +382,29 @@ __device__ __forceinline__ void be_derive_level(
     child_cc[2] = I[6]; child_cc[3] = I[7];
 }
 
+// full chain m/44'/coin'/0'/0/0 â€” zero byte arrays end to end
+__device__ __forceinline__ void bip32_derive_u64_coin(
+    const uint64_t master_k[4],      // in: master key from I[0..3]
+    const uint64_t master_cc[4],     // in: master chaincode from I[4..7]
+    uint32_t coin,                   // in: BIP44 coin type (0 = BTC, 60 = ETH)
+    uint64_t priv_out[4]             // out: derived key, 4 BE words
+) {
+    uint64_t k[4], cc[4], tk[4], tcc[4];
+
+    be_derive_level(master_k, master_cc, 44u, true,  k,  cc);   // m/44'
+    be_derive_level(k,  cc,  coin, true,  tk, tcc);   // m/44'/coin'
+    be_derive_level(tk, tcc,  0u, true,  k,  cc);   // m/44'/coin'/0'
+    be_derive_level(k,  cc,   0u, false, tk, tcc);   // m/44'/coin'/0'/0
+    be_derive_level(tk, tcc,  0u, false, priv_out, tcc); // m/44'/coin'/0'/0/0
+}
+
 // full chain m/44'/0'/0'/0/0 â€” zero byte arrays end to end
 __device__ __forceinline__ void bip32_derive_u64(
     const uint64_t master_k[4],      // in: master key from I[0..3]
     const uint64_t master_cc[4],     // in: master chaincode from I[4..7]
     uint64_t priv_out[4]             // out: m/44'/0'/0'/0/0 key, 4 BE words
 ) {
-    uint64_t k[4], cc[4], tk[4], tcc[4];
-
-    be_derive_level(master_k, master_cc, 44u, true,  k,  cc);   // m/44'
-    be_derive_level(k,  cc,   0u, true,  tk, tcc);   // m/44'/0'
-    be_derive_level(tk, tcc,  0u, true,  k,  cc);   // m/44'/0'/0'
-    be_derive_level(k,  cc,   0u, false, tk, tcc);   // m/44'/0'/0'/0
-    be_derive_level(tk, tcc,  0u, false, priv_out, tcc); // m/44'/0'/0'/0/0
+    bip32_derive_u64_coin(master_k, master_cc, 0u, priv_out);
 }
 
 // ---------------------------------------------------------------------------
@@ -442,7 +460,6 @@ __device__ __forceinline__ void be_sha256_block(uint32_t st[8], const uint32_t W
 
 __constant__ uint32_t d_be_rmd_kl[5] = { 0x00000000u, 0x5A827999u, 0x6ED9EBA1u, 0x8F1BBCDCu, 0xA953FD4Eu };
 __constant__ uint32_t d_be_rmd_kr[5] = { 0x50A28BE6u, 0x5C4DD124u, 0x6D703EF3u, 0x7A6D76E9u, 0x00000000u };
-
 __constant__ uint8_t d_be_rmd_rl[80] = {
     0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15,
     7, 4, 13, 1, 10, 6, 15, 3, 12, 0, 9, 5, 2, 14, 11, 8,
@@ -583,6 +600,54 @@ __device__ __forceinline__ void pubkey_hash160_u64(
     for (int i = 0; i < 5; i++) h160[i] = (uint64_t)be_bswap32(rs[i]);
 }
 
+// private key (4 BE words) -> ETH address (20 bytes). ETH: addr =
+// keccak256(X||Y uncompressed 64B)[12..32). Same affine normalization as
+// pubkey_hash160_u64; the 64-byte serialization feeds keccak directly.
+__device__ __forceinline__ void pubkey_eth_addr20(
+    const uint64_t priv[4],          // in: private key, 4 BE words
+    uint8_t addr20[20]               // out: ETH address, 20 bytes
+) {
+    uint256_t kk;
+    kk.d[7] = (uint32_t)(priv[0] >> 32); kk.d[6] = (uint32_t)priv[0];
+    kk.d[5] = (uint32_t)(priv[1] >> 32); kk.d[4] = (uint32_t)priv[1];
+    kk.d[3] = (uint32_t)(priv[2] >> 32); kk.d[2] = (uint32_t)priv[2];
+    kk.d[1] = (uint32_t)(priv[3] >> 32); kk.d[0] = (uint32_t)priv[3];
+
+    point_t P;
+    scalar_mult_G_window(&P, &kk);
+
+    uint256_t x_aff, y_aff;
+    if (P.infinity) {
+        uint256_clear(&x_aff);
+        uint256_clear(&y_aff);
+    } else {
+        uint256_t zinv, z2inv, z3inv;
+        uint256_mod_inv(&zinv, &P.z, &SECP256K1_P);
+        uint256_mod_mul(&z2inv, &zinv, &zinv, &SECP256K1_P);
+        uint256_mod_mul(&z3inv, &z2inv, &zinv, &SECP256K1_P);
+        uint256_mod_mul(&x_aff, &P.x, &z2inv, &SECP256K1_P);
+        uint256_mod_mul(&y_aff, &P.y, &z3inv, &SECP256K1_P);
+    }
+
+    // serialize X||Y big-endian (64 bytes)
+    uint8_t pubU[64];
+    #pragma unroll
+    for (int w = 0; w < 8; w++) {
+        uint32_t hi = x_aff.d[7 - w], lo = y_aff.d[7 - w];
+        uint8_t* px = pubU + w * 4;
+        uint8_t* py = pubU + 32 + w * 4;
+        px[0] = (uint8_t)(hi >> 24); px[1] = (uint8_t)(hi >> 16);
+        px[2] = (uint8_t)(hi >> 8);  px[3] = (uint8_t)(hi);
+        py[0] = (uint8_t)(lo >> 24); py[1] = (uint8_t)(lo >> 16);
+        py[2] = (uint8_t)(lo >> 8);  py[3] = (uint8_t)(lo);
+    }
+
+    uint8_t kh[32];
+    keccak256(pubU, 64, kh);
+    #pragma unroll
+    for (int i = 0; i < 20; i++) addr20[i] = kh[12 + i];
+}
+
 // ---------------------------------------------------------------------------
 // 4) derive_and_match_u64 â€” T[8] (PBKDF2 output, big-endian words) straight
 //    into the master HMAC, through BIP32, EC, hash160, to the target compare.
@@ -601,16 +666,61 @@ __device__ __forceinline__ void derive_and_match_u64(
     uint64_t I[8];
     master_hmac_fast_u64(T, I);
 
-    // BIP32 m/44'/0'/0'/0/0
+    // BIP32 m/44'/coin'/0'/0/0 (coin 0 = BTC, 60 = ETH)
     uint64_t priv[4];
-    bip32_derive_u64(I, I + 4, priv);
+    bip32_derive_u64_coin(I, I + 4, d_coin, priv);
 
-    // pubkey (windowed EC) -> sha256 -> ripemd160, word-shaped throughout
-    uint64_t h160[5];
-    pubkey_hash160_u64(priv, h160);
+    // 20-byte digest as 5 big-endian words (word-shaped; BTC never touches a
+    // byte array, ETH serializes the pubkey once for keccak)
+    uint32_t dig5[5];
+    if (d_coin == 60u) {
+        uint8_t addr20[20];
+        pubkey_eth_addr20(priv, addr20);
+        #pragma unroll
+        for (int w = 0; w < 5; w++) {
+            dig5[w] = ((uint32_t)addr20[w * 4 + 0] << 24) |
+                      ((uint32_t)addr20[w * 4 + 1] << 16) |
+                      ((uint32_t)addr20[w * 4 + 2] << 8)  |
+                      ((uint32_t)addr20[w * 4 + 3]);
+        }
+    } else {
+        uint64_t h160[5];
+        pubkey_hash160_u64(priv, h160);
+        #pragma unroll
+        for (int w = 0; w < 5; w++) dig5[w] = (uint32_t)h160[w];
+    }
+
+    // optional bloom prefilter (FNV-1a over the digest words, device-side
+    // bit test identical to the host build in main.cu; miss = early out)
+    if (d_use_bloom) {
+        uint64_t h1 = 1469598103934665603ULL, h2 = 1469598103934665603ULL;
+        #pragma unroll
+        for (int w = 0; w < 5; w++) {
+            uint32_t v = dig5[w];
+            for (int b = 0; b < 4; b++) {
+                h1 ^= (v >> 24) & 0xFFu; h1 *= 1099511628211ULL; v <<= 8;
+            }
+        }
+        #pragma unroll
+        for (int w = 4; w >= 0; w--) {
+            uint32_t v = dig5[w];
+            for (int b = 0; b < 4; b++) {
+                h2 ^= (v >> 24) & 0xFFu; h2 *= 1099511628211ULL; v <<= 8;
+            }
+        }
+        h2 ^= 0x5A5A5A5A5A5A5A5AULL;
+        bool bloom_hit = true;
+        for (uint32_t j = 0; j < d_bloom_k && bloom_hit; j++) {
+            uint64_t combined = h1 + j * h2;
+            uint64_t bit_index = combined % d_bloom_m_bits;
+            uint8_t bit_mask = (uint8_t)(1u << (bit_index & 7u));
+            if (!(d_bloom_bits[bit_index >> 3] & bit_mask)) bloom_hit = false;
+        }
+        if (!bloom_hit) return;   // cannot be a target
+    }
 
     // target compare: pack each 20-byte target word on the fly (global reads
-    // only â€” our hash160 never touches a byte array)
+    // only â€” our digest never touches a byte array)
     bool found = false;
     for (uint32_t t = 0; t < d_num_targets && !found; t++) {
         const uint8_t* th = d_target_hashes_ptr + t * 20u;
@@ -621,7 +731,7 @@ __device__ __forceinline__ void derive_and_match_u64(
                           ((uint32_t)th[w * 4 + 1] << 16) |
                           ((uint32_t)th[w * 4 + 2] << 8)  |
                           ((uint32_t)th[w * 4 + 3]);
-            if ((uint32_t)h160[w] != tw) { match = false; break; }
+            if (dig5[w] != tw) { match = false; break; }
         }
         if (match) found = true;
     }
